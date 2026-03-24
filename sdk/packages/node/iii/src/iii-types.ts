@@ -84,7 +84,10 @@ export type HttpInvocationConfig = {
 }
 
 export type RegisterFunctionFormat = {
-  name: string
+  /**
+   * The name of the parameter
+   */
+  name?: string
   /**
    * The description of the parameter
    */
@@ -96,7 +99,7 @@ export type RegisterFunctionFormat = {
   /**
    * The body of the parameter
    */
-  body?: RegisterFunctionFormat[]
+  properties?: Record<string, RegisterFunctionFormat>
   /**
    * The items of the parameter
    */
@@ -104,7 +107,7 @@ export type RegisterFunctionFormat = {
   /**
    * Whether the parameter is required
    */
-  required?: boolean
+  required?: string[]
 }
 
 export type RegisterFunctionMessage = {
