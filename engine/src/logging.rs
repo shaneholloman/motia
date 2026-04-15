@@ -490,8 +490,29 @@ pub fn init_log_from_config(config_path: Option<&str>) {
     }
 }
 
+/// Disable ANSI color output in the `colored` crate process-wide.
+///
+/// Why: the engine's `tracing::info!(...)` macros interpolate colored
+/// strings (e.g. `"[UNREGISTERED]".red()`) that the `colored` crate
+/// resolves to ANSI escapes at call time. When the JSON formatter then
+/// serializes the `message` field, those escape bytes are preserved
+/// verbatim, producing log lines like `"\u001b[31m[UNREGISTERED]\u001b[0m"`
+/// that break downstream JSON log consumers (MOT-2812).
+///
+/// Setting the `colored` override to `false` makes every subsequent
+/// `.red()` / `.bold()` / etc. a no-op string wrapper, so JSON logs stay
+/// plain ASCII. Local text logging never calls this, so human-readable
+/// logs keep their colors.
+fn disable_ansi_for_json_logs() {
+    colored::control::set_override(false);
+}
+
 fn init_prod_log(log_level: &str, otel_cfg: &OtelConfig) {
     TRACING.get_or_init(|| {
+        // Prevent ANSI escape codes from leaking into JSON-formatted logs.
+        // See `disable_ansi_for_json_logs` for rationale (MOT-2812).
+        disable_ansi_for_json_logs();
+
         let filter = EnvFilter::new(log_level);
 
         // JSON formatting layer
@@ -624,6 +645,52 @@ mod tests {
         // Should still init logging even if file doesn't exist —
         // logging init should not crash the process, just fall back
         init_log_from_config(Some("/tmp/iii_no_such_logging_config_98765.yaml"));
+    }
+
+    #[test]
+    #[serial]
+    fn colored_emits_ansi_when_override_true() {
+        // Baseline: when we force the colored override on, ANSI escapes appear in the
+        // output. Regression guard so Task 2's JSON-mode test has something to negate.
+        colored::control::set_override(true);
+        let s = format!("{}", "hello".red());
+        assert!(
+            s.contains('\u{1b}'),
+            "expected ANSI escape in colored output with override=true, got {:?}",
+            s
+        );
+        colored::control::unset_override();
+    }
+
+    #[test]
+    #[serial]
+    fn init_prod_log_disables_ansi_in_colored_crate() {
+        // Arrange: force ANSI on, then sanity-check the precondition.
+        colored::control::set_override(true);
+        assert!(
+            format!("{}", "x".red()).contains('\u{1b}'),
+            "precondition failed: colored should be emitting ANSI when override is true"
+        );
+
+        // Act: apply just the color-override step from the JSON init path.
+        // We cannot call `init_prod_log` directly in a unit test because it
+        // installs a global tracing subscriber via OnceCell — only one process-
+        // wide init is allowed. Instead, we call the small extracted helper.
+        disable_ansi_for_json_logs();
+
+        // Assert: any subsequent `.red()` / `.purple()` produces plain text.
+        let red = format!("{}", "[UNREGISTERED]".red());
+        let purple = format!("{}", "discord::send_message".purple());
+        assert_eq!(red, "[UNREGISTERED]", "red() must not inject ANSI");
+        assert_eq!(
+            purple, "discord::send_message",
+            "purple() must not inject ANSI"
+        );
+        assert!(!red.contains('\u{1b}'));
+        assert!(!purple.contains('\u{1b}'));
+
+        // Cleanup so other #[serial] tests start from a known state.
+        colored::control::unset_override();
     }
 
     // =========================================================================
