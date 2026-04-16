@@ -736,35 +736,63 @@ fn clear_all_workers(skip_confirm: bool) -> i32 {
 /// Kill any stale worker process from a previous engine run.
 /// Checks OCI/local (vm.pid) and binary (pids/{name}.pid) PID files,
 /// sends SIGTERM+SIGKILL, and removes the PID file.
+/// Kill the host-side source watcher sidecar for `worker_name` and
+/// remove its pid file. No-op when no watcher is running.
+///
+/// Called from the stop path so the watcher doesn't observe the VM
+/// shutdown as a file event and race to restart what we just stopped.
+/// Also called by `kill_stale_worker` (indirectly, via `watch.pid` in
+/// its pid file list) to reap leaks from crashed starts.
+pub async fn reap_source_watcher(worker_name: &str) {
+    let home = dirs::home_dir().unwrap_or_default();
+    let watch_pidfile = home
+        .join(".iii/managed")
+        .join(worker_name)
+        .join("watch.pid");
+    if let Some(watch_pid) = read_pid(&watch_pidfile) {
+        kill_pid_with_grace(watch_pid).await;
+    }
+    let _ = std::fs::remove_file(&watch_pidfile);
+}
+
 pub async fn kill_stale_worker(worker_name: &str) {
     let home = dirs::home_dir().unwrap_or_default();
     let pid_files = [
         home.join(".iii/managed").join(worker_name).join("vm.pid"),
+        home.join(".iii/managed")
+            .join(worker_name)
+            .join("watch.pid"),
         home.join(".iii/pids").join(format!("{}.pid", worker_name)),
     ];
 
     for pid_file in &pid_files {
-        if let Ok(pid_str) = tokio::fs::read_to_string(pid_file).await {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                #[cfg(unix)]
-                {
-                    use nix::sys::signal::{Signal, kill};
-                    use nix::unistd::Pid;
-                    let p = Pid::from_raw(pid);
-                    // Only kill if process is still alive
-                    if kill(p, None).is_ok() {
-                        tracing::info!(worker = %worker_name, pid, "Killing stale worker process");
-                        let _ = kill(p, Signal::SIGTERM);
-                        // Brief wait then force-kill
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        let _ = kill(p, Signal::SIGKILL);
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = pid;
+        // Route through the hardened reader so a pre-planted symlink
+        // at `pid_file` can't redirect us into an arbitrary file, and
+        // a pidfile owned by another uid is ignored instead of honored.
+        // We still attempt `remove_file` whenever the file exists so
+        // stale/unreadable pidfiles get cleaned up regardless.
+        let existed = pid_file.exists();
+        if let Some(pid) = read_pid(pid_file) {
+            #[cfg(unix)]
+            {
+                use nix::sys::signal::{Signal, kill};
+                use nix::unistd::Pid;
+                let p = Pid::from_raw(pid as i32);
+                // Only kill if process is still alive.
+                if kill(p, None).is_ok() {
+                    tracing::info!(worker = %worker_name, pid, "Killing stale worker process");
+                    let _ = kill(p, Signal::SIGTERM);
+                    // Brief wait then force-kill.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let _ = kill(p, Signal::SIGKILL);
                 }
             }
+            #[cfg(not(unix))]
+            {
+                let _ = pid;
+            }
+        }
+        if existed {
             let _ = tokio::fs::remove_file(pid_file).await;
         }
     }
@@ -1011,10 +1039,8 @@ pub fn is_worker_running(worker_name: &str) -> bool {
     let bin_pid = home.join(".iii/pids").join(format!("{}.pid", worker_name));
 
     for pid_file in [oci_pid, bin_pid] {
-        if let Ok(pid_str) = std::fs::read_to_string(&pid_file)
-            && let Ok(pid) = pid_str.trim().parse::<u32>()
-        {
-            // Check if process is alive (signal 0 = existence check)
+        if let Some(pid) = read_pid(&pid_file) {
+            // Check if process is alive (signal 0 = existence check).
             #[cfg(unix)]
             {
                 use nix::sys::signal::kill;
@@ -1026,7 +1052,7 @@ pub fn is_worker_running(worker_name: &str) -> bool {
             #[cfg(not(unix))]
             {
                 let _ = pid;
-                // On non-Unix, assume running if PID file exists
+                // On non-Unix, assume running if PID file exists.
                 return true;
             }
         }
@@ -1256,6 +1282,12 @@ pub async fn handle_managed_stop(worker_name: &str) -> i32 {
         );
         return 1;
     } else {
+        // VM died out-of-band but the watcher sidecar may still be
+        // alive holding watch.pid — if we return here without reaping
+        // it, the watcher will keep firing on file changes and try to
+        // respawn a VM that nothing is tracking. Tear it down before
+        // reporting "already stopped."
+        reap_source_watcher(worker_name).await;
         eprintln!("  {} {} already stopped", "✓".green(), worker_name.bold());
         println!("{}", worker_name);
         return 0;
@@ -1265,6 +1297,26 @@ pub async fn handle_managed_stop(worker_name: &str) -> i32 {
 
     match mode {
         StopMode::Managed { pid, pidfile } => {
+            // Tear down the source watcher sidecar first so it doesn't
+            // observe the VM shutdown as a file event and try to restart.
+            reap_source_watcher(worker_name).await;
+
+            // Ask the in-VM supervisor to shut its child down cleanly.
+            // The supervisor exits on success, which triggers libkrun's
+            // poweroff path, which is faster and cleaner than a bare
+            // SIGTERM to the __vm-boot process. We still fall through
+            // to adapter.stop below — if the supervisor wasn't reachable
+            // (binary missing, channel dead), that's the authoritative
+            // teardown; if the shutdown succeeded, adapter.stop's
+            // SIGTERM becomes a no-op against an already-exiting VM.
+            if let Err(e) = super::supervisor_ctl::request_shutdown(worker_name).await {
+                tracing::debug!(
+                    worker = %worker_name,
+                    error = %e,
+                    "supervisor shutdown unavailable, falling through to SIGTERM"
+                );
+            }
+
             let adapter = super::worker_manager::create_adapter("libkrun");
             let _ = adapter.stop(&pid.to_string(), 10).await;
             if let Some(f) = pidfile {
@@ -1299,10 +1351,45 @@ enum StopMode {
 }
 
 /// Reads a PID file, returning `Some(pid)` when contents parse as `u32`.
+///
+/// On Unix, opens with `O_NOFOLLOW` + verifies the opened file is a
+/// regular file owned by the current euid before reading. Defends
+/// against symlink-replace attacks: a local attacker who can write
+/// into the managed dir can't redirect the read elsewhere, and can't
+/// trick us into treating a file they own as a valid pid marker that
+/// we then `kill()` on. On non-Unix platforms falls back to plain
+/// read_to_string.
 fn read_pid(path: &std::path::Path) -> Option<u32> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(path)
+            .ok()?;
+        let meta = file.metadata().ok()?;
+        if !meta.file_type().is_file() {
+            return None;
+        }
+        let our_uid = unsafe { nix::libc::geteuid() };
+        if meta.uid() != our_uid {
+            return None;
+        }
+        // Cap at a few bytes — a PID is at most 10 decimal digits.
+        let mut buf = [0u8; 32];
+        let n = file.read(&mut buf).ok()?;
+        let s = std::str::from_utf8(&buf[..n]).ok()?;
+        return s.trim().parse::<u32>().ok();
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+    }
 }
 
 /// Returns `true` if `pid` refers to a live process. Uses signal 0 as a
@@ -1598,9 +1685,10 @@ async fn start_oci_worker(worker_name: &str, worker_def: &WorkerDef, port: u16) 
         .join(".iii/managed")
         .join(worker_name)
         .join("vm.pid");
-    if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
-        let _ = adapter.stop(pid_str.trim(), 5).await;
-        let _ = adapter.remove(pid_str.trim()).await;
+    if let Some(pid) = read_pid(&pid_file) {
+        let pid_str = pid.to_string();
+        let _ = adapter.stop(&pid_str, 5).await;
+        let _ = adapter.remove(&pid_str).await;
     }
 
     match adapter.start(&spec).await {
@@ -2608,6 +2696,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kill_stale_worker_removes_watch_pid_file() {
+        // Writes a fake `watch.pid` with a highly unlikely-to-be-alive
+        // PID, then verifies `kill_stale_worker` reaps it from the
+        // pid-file list introduced when the source watcher sidecar
+        // landed. Uses a unique worker name to avoid collisions with
+        // any real workers on the developer's machine.
+        let home = dirs::home_dir().unwrap_or_default();
+        let worker_name = "__iii_test_watch_pid_cleanup__";
+        let managed_dir = home.join(".iii/managed").join(worker_name);
+        let _ = std::fs::create_dir_all(&managed_dir);
+        let watch_pidfile = managed_dir.join("watch.pid");
+        std::fs::write(&watch_pidfile, "2000000000").unwrap();
+        assert!(watch_pidfile.exists());
+
+        kill_stale_worker(worker_name).await;
+
+        assert!(
+            !watch_pidfile.exists(),
+            "watch.pid should be reaped by kill_stale_worker"
+        );
+
+        let _ = std::fs::remove_dir_all(&managed_dir);
+    }
+
+    #[tokio::test]
+    async fn reap_source_watcher_removes_pid_file() {
+        // Exercises the stop-path helper used by `handle_managed_stop`
+        // to tear down the watcher sidecar before stopping the VM. A
+        // dead PID in watch.pid should still produce a clean remove
+        // (signal(0) returns ESRCH, kill_pid_with_grace no-ops, file
+        // is unlinked unconditionally).
+        let home = dirs::home_dir().unwrap_or_default();
+        let worker_name = "__iii_test_reap_watcher__";
+        let managed_dir = home.join(".iii/managed").join(worker_name);
+        let _ = std::fs::create_dir_all(&managed_dir);
+        let watch_pidfile = managed_dir.join("watch.pid");
+        std::fs::write(&watch_pidfile, "2000000001").unwrap();
+        assert!(watch_pidfile.exists());
+
+        reap_source_watcher(worker_name).await;
+
+        assert!(
+            !watch_pidfile.exists(),
+            "watch.pid should be removed by reap_source_watcher"
+        );
+
+        let _ = std::fs::remove_dir_all(&managed_dir);
+    }
+
+    #[tokio::test]
+    async fn reap_source_watcher_no_op_when_no_pid_file() {
+        // Idempotent on the cold path — no watch.pid, nothing to do,
+        // no panic.
+        reap_source_watcher("__iii_test_reap_watcher_nonexistent__").await;
+    }
+
+    #[tokio::test]
+    async fn reap_source_watcher_handles_garbage_pid_content() {
+        // Parse failure must not prevent file removal.
+        let home = dirs::home_dir().unwrap_or_default();
+        let worker_name = "__iii_test_reap_watcher_garbage__";
+        let managed_dir = home.join(".iii/managed").join(worker_name);
+        let _ = std::fs::create_dir_all(&managed_dir);
+        let watch_pidfile = managed_dir.join("watch.pid");
+        std::fs::write(&watch_pidfile, "not-a-pid").unwrap();
+
+        reap_source_watcher(worker_name).await;
+
+        assert!(!watch_pidfile.exists());
+        let _ = std::fs::remove_dir_all(&managed_dir);
+    }
+
+    #[tokio::test]
     async fn kill_stale_worker_handles_invalid_pid_content() {
         // Use real function with a worker name that won't collide
         // The function should handle garbage content gracefully
@@ -2621,6 +2782,38 @@ mod tests {
 
         // File should still be removed even with garbage content
         assert!(!pid_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_stale_worker_ignores_symlinked_pidfile() {
+        // A pre-planted symlink at the pidfile location must not be
+        // followed: read_pid opens with O_NOFOLLOW and returns None, so
+        // we skip the kill. The symlink itself is still removed so
+        // subsequent starts aren't jammed up by stale state.
+        let home = dirs::home_dir().unwrap_or_default();
+        let worker_name = "__iii_test_symlink_pidfile__";
+        let managed_dir = home.join(".iii/managed").join(worker_name);
+        let _ = std::fs::create_dir_all(&managed_dir);
+
+        // Attacker-controlled file we must NOT overwrite or target.
+        let sensitive = managed_dir.join("sensitive");
+        std::fs::write(&sensitive, "DO-NOT-TOUCH").unwrap();
+
+        let watch_pidfile = managed_dir.join("watch.pid");
+        std::os::unix::fs::symlink(&sensitive, &watch_pidfile).unwrap();
+
+        kill_stale_worker(worker_name).await;
+
+        // Symlink removed, target untouched.
+        assert!(!watch_pidfile.exists(), "symlink should be cleaned up");
+        assert_eq!(
+            std::fs::read_to_string(&sensitive).unwrap(),
+            "DO-NOT-TOUCH",
+            "symlink target must not be read/modified"
+        );
+
+        let _ = std::fs::remove_dir_all(&managed_dir);
     }
 
     #[test]
