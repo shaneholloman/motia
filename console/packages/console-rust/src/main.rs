@@ -118,6 +118,7 @@ async fn main() -> Result<()> {
             }),
             otel: otel_config,
             headers: None,
+            ..Default::default()
         },
     );
 
