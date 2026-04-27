@@ -26,7 +26,7 @@
 use colored::Colorize;
 
 use super::binary_download;
-use super::builtin_defaults::get_builtin_default;
+use super::builtin_defaults::{get_builtin_default, is_any_builtin, resolve_builtin_version};
 use super::config_file::ResolvedWorkerType;
 use super::lifecycle::build_container_spec;
 use super::registry::{
@@ -36,6 +36,42 @@ use super::registry::{
 use super::worker_manager::state::WorkerDef;
 
 pub use super::local_worker::{handle_local_add, is_local_path, start_local_worker};
+
+/// Fire `GET /download/{name}` for an engine worker so the registry increments
+/// its telemetry counters. The endpoint returns 204 (no artifact); errors are
+/// logged as warnings and never block the install.
+async fn fire_engine_telemetry(name: &str, version: &str) {
+    use super::registry::HTTP_CLIENT;
+
+    let api_url =
+        std::env::var("III_API_URL").unwrap_or_else(|_| "https://api.workers.iii.dev".to_string());
+    let url = format!("{api_url}/download/{name}");
+
+    match HTTP_CLIENT
+        .get(&url)
+        .query(&[("version", version)])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().as_u16() == 204 => {}
+        Ok(resp) => {
+            eprintln!(
+                "  {} telemetry for {} returned unexpected status {}",
+                "warn:".yellow(),
+                name,
+                resp.status()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} telemetry for {} failed: {}",
+                "warn:".yellow(),
+                name,
+                e
+            );
+        }
+    }
+}
 
 pub async fn handle_binary_add(
     worker_name: &str,
@@ -255,7 +291,7 @@ fn should_verify_config_worker(lockfile: &super::lockfile::WorkerLockfile, name:
         return true;
     }
 
-    if get_builtin_default(name).is_some() {
+    if super::builtin_defaults::is_any_builtin(name) {
         return false;
     }
 
@@ -345,7 +381,8 @@ fn lockfile_from_graph(
     let mut lock = super::lockfile::WorkerLockfile::default();
 
     for node in &graph.graph {
-        let source = match node.worker_type.as_str() {
+        let (worker_type, source) = match node.worker_type.as_str() {
+            "engine" => (super::lockfile::LockedWorkerType::Engine, None),
             "binary" => {
                 let binaries = node.binaries.as_ref().ok_or_else(|| {
                     format!("resolved binary worker '{}' has no binaries", node.name)
@@ -368,14 +405,19 @@ fn lockfile_from_graph(
                         )
                     })
                     .collect();
-                super::lockfile::LockedSource::Binary { artifacts }
+                (
+                    super::lockfile::LockedWorkerType::Binary,
+                    Some(super::lockfile::LockedSource::Binary { artifacts }),
+                )
             }
-            "image" => super::lockfile::LockedSource::Image {
-                image: node
-                    .image
-                    .clone()
-                    .ok_or_else(|| format!("resolved image worker '{}' has no image", node.name))?,
-            },
+            "image" => (
+                super::lockfile::LockedWorkerType::Image,
+                Some(super::lockfile::LockedSource::Image {
+                    image: node.image.clone().ok_or_else(|| {
+                        format!("resolved image worker '{}' has no image", node.name)
+                    })?,
+                }),
+            ),
             other => {
                 return Err(format!(
                     "resolved worker '{}' has unsupported type '{}'",
@@ -388,11 +430,7 @@ fn lockfile_from_graph(
             node.name.clone(),
             super::lockfile::LockedWorker {
                 version: node.version.clone(),
-                worker_type: if node.worker_type == "image" {
-                    super::lockfile::LockedWorkerType::Image
-                } else {
-                    super::lockfile::LockedWorkerType::Binary
-                },
+                worker_type,
                 dependencies: node.dependencies.clone().into_iter().collect(),
                 source,
             },
@@ -472,6 +510,38 @@ fn read_lockfile_or_default(
     }
 }
 
+fn write_engine_lock_entry(worker_name: &str, version: &str) -> Result<(), String> {
+    let lock_path = super::lockfile::lockfile_path();
+    let mut lockfile = read_lockfile_or_default(&lock_path)?;
+    lockfile.workers.insert(
+        worker_name.to_string(),
+        super::lockfile::LockedWorker {
+            version: version.to_string(),
+            worker_type: super::lockfile::LockedWorkerType::Engine,
+            dependencies: std::collections::BTreeMap::new(),
+            source: None,
+        },
+    );
+    lockfile.write_to(&lock_path)
+}
+
+fn persist_engine_worker_config_and_lock(
+    worker_name: &str,
+    version: &str,
+    config_yaml: Option<&str>,
+) -> Result<(), String> {
+    let config_snapshot = ConfigYamlSnapshot::capture()?;
+    if let Err(e) = super::config_file::append_worker(worker_name, config_yaml) {
+        config_snapshot.restore_after_failure();
+        return Err(e);
+    }
+    if let Err(e) = write_engine_lock_entry(worker_name, version) {
+        config_snapshot.restore_after_failure();
+        return Err(e);
+    }
+    Ok(())
+}
+
 async fn handle_resolved_graph_add(graph: &ResolvedWorkerGraph, brief: bool) -> i32 {
     for node in &graph.graph {
         if let Err(e) = super::registry::validate_worker_name(&node.name) {
@@ -515,6 +585,23 @@ async fn handle_resolved_graph_add(graph: &ResolvedWorkerGraph, brief: bool) -> 
 
     for node in &graph.graph {
         let rc = match node.worker_type.as_str() {
+            "engine" => {
+                // Engine workers are baked into the iii binary — nothing to download.
+                // Fire GET /download/{name} anyway so the registry can count installs.
+                let config_yaml = binary_config_yaml(&node.config);
+                if let Err(e) =
+                    super::config_file::append_worker(&node.name, config_yaml.as_deref())
+                {
+                    eprintln!("{} {}", "error:".red(), e);
+                    config_snapshot.restore_after_failure();
+                    return 1;
+                }
+                fire_engine_telemetry(&node.name, &node.version).await;
+                if !brief {
+                    eprintln!("  {} {} (engine, built-in)", "✓".green(), node.name.bold());
+                }
+                0
+            }
             "binary" => {
                 let response = BinaryWorkerResponse {
                     name: node.name.clone(),
@@ -724,7 +811,7 @@ pub async fn handle_managed_add(
             }
         }
 
-        if super::builtin_defaults::get_builtin_default(&plain_name).is_some() {
+        if is_any_builtin(&plain_name) {
             eprintln!(
                 "  {} '{}' is a builtin worker, no artifacts to re-download.",
                 "info:".cyan(),
@@ -776,8 +863,13 @@ pub async fn handle_managed_add(
 
     // Check for engine-builtin workers first (no network needed).
     if let Some(default_yaml) = get_builtin_default(&name) {
+        let builtin_version = resolve_builtin_version(version.as_deref());
         let already_exists = super::config_file::worker_exists(&name);
-        if let Err(e) = super::config_file::append_worker(&name, Some(default_yaml)) {
+        if let Err(e) = persist_engine_worker_config_and_lock(
+            &name,
+            builtin_version,
+            Some(default_yaml.as_str()),
+        ) {
             eprintln!("{} {}", "error:".red(), e);
             return 1;
         }
@@ -814,6 +906,8 @@ pub async fn handle_managed_add(
         // Builtins run in-process with the engine; there is no detached VM
         // or binary to watch. The Phase machinery would loop on Queued until
         // timeout, so skip wait_for_ready for builtins even when wait=true.
+        // Fire telemetry so the registry can count this activation.
+        fire_engine_telemetry(&name, builtin_version).await;
         return 0;
     }
 
@@ -851,6 +945,23 @@ pub async fn handle_managed_add(
             }
             handle_oci_pull_and_add(&r.name, &r.image_url, brief).await
         }
+        WorkerInfoResponse::Engine(r) => {
+            // Engine workers are built into the iii binary; telemetry was already
+            // fired by fetch_worker_info via the 204 response path.
+            if let Err(e) = persist_engine_worker_config_and_lock(&r.name, &r.version, None) {
+                eprintln!("{} {}", "error:".red(), e);
+                return 1;
+            }
+            if !brief {
+                eprintln!(
+                    "\n  {} {} v{} (engine, built-in — nothing to download)",
+                    "✓".green(),
+                    r.name.bold(),
+                    r.version
+                );
+            }
+            0
+        }
     };
     finish_add(&name, rc, wait, brief).await
 }
@@ -874,6 +985,9 @@ fn should_fallback_to_legacy_registry_error(name: &str, error: &str) -> bool {
 /// and a blocking wait per entry would produce confusing output).
 async fn finish_add(worker_name: &str, rc: i32, wait: bool, brief: bool) -> i32 {
     if rc != 0 || !wait || brief {
+        return rc;
+    }
+    if is_any_builtin(worker_name) {
         return rc;
     }
     let port = super::config_file::manager_port();
@@ -1999,7 +2113,7 @@ pub async fn handle_managed_start(worker_name: &str, wait: bool, port: u16) -> i
     // Only treat this as success when the builtin is actually configured in
     // config.yaml AND the engine is running -- otherwise `start` is lying by
     // returning 0 for a no-op and automation thinks something booted.
-    if get_builtin_default(worker_name).is_some() {
+    if is_any_builtin(worker_name) {
         if !super::config_file::worker_exists(worker_name) {
             eprintln!(
                 "{} '{}' is a builtin but is not configured. Run `iii worker add {}` first.",
@@ -2101,6 +2215,32 @@ pub async fn handle_managed_start(worker_name: &str, wait: bool, port: u16) -> i
             };
             let rc = start_oci_worker(worker_name, &worker_def, port).await;
             return finish_start(worker_name, rc, wait, port).await;
+        }
+        Ok(WorkerInfoResponse::Engine(_)) => {
+            if !super::config_file::worker_exists(worker_name) {
+                eprintln!(
+                    "{} '{}' is an engine builtin but is not configured. Run `iii worker add {}` first.",
+                    "error:".red(),
+                    worker_name,
+                    worker_name,
+                );
+                return 1;
+            }
+            if !is_engine_running() {
+                eprintln!(
+                    "{} '{}' is an engine builtin, but the engine isn't running.\n  \
+                     Start the engine:  iii start",
+                    "error:".red(),
+                    worker_name,
+                );
+                return 1;
+            }
+            eprintln!(
+                "  {} '{}' is an engine builtin — it starts automatically with `iii start`.",
+                "info:".cyan(),
+                worker_name
+            );
+            return 0;
         }
         Err(e) => {
             tracing::warn!("Failed to fetch worker info: {}", e);
@@ -2758,8 +2898,12 @@ mod tests {
         format!("{:x}", hasher.finalize())
     }
 
-    fn locked_binary_source(target: &str, url: &str, sha256: String) -> cli_lockfile::LockedSource {
-        cli_lockfile::LockedSource::Binary {
+    fn locked_binary_source(
+        target: &str,
+        url: &str,
+        sha256: String,
+    ) -> Option<cli_lockfile::LockedSource> {
+        Some(cli_lockfile::LockedSource::Binary {
             artifacts: std::collections::BTreeMap::from([(
                 target.to_string(),
                 cli_lockfile::LockedBinaryArtifact {
@@ -2767,7 +2911,7 @@ mod tests {
                     sha256,
                 },
             )]),
-        }
+        })
     }
 
     async fn spawn_static_http_server(
@@ -2865,6 +3009,19 @@ mod tests {
         }
     }
 
+    fn resolved_engine_worker(name: &str, version: &str) -> cli_registry::ResolvedWorker {
+        cli_registry::ResolvedWorker {
+            name: name.to_string(),
+            worker_type: "engine".to_string(),
+            version: version.to_string(),
+            repo: format!("https://example.com/{name}"),
+            config: serde_json::Value::Null,
+            binaries: None,
+            image: None,
+            dependencies: StdHashMap::new(),
+        }
+    }
+
     fn graph_with(worker: cli_registry::ResolvedWorker) -> cli_registry::ResolvedWorkerGraph {
         cli_registry::ResolvedWorkerGraph {
             root: cli_registry::ResolvedRoot {
@@ -2913,7 +3070,7 @@ mod tests {
         let lock = lockfile_from_graph(&graph_with(worker)).unwrap();
         let entry = lock.workers.get("hello-worker").expect("entry present");
 
-        match &entry.source {
+        match entry.source.as_ref().unwrap() {
             cli_lockfile::LockedSource::Binary { artifacts } => {
                 assert_eq!(artifacts.len(), 2);
                 assert_eq!(
@@ -2978,7 +3135,7 @@ mod tests {
             entry.worker_type,
             cli_lockfile::LockedWorkerType::Binary
         ));
-        match &entry.source {
+        match entry.source.as_ref().unwrap() {
             cli_lockfile::LockedSource::Binary { artifacts } => {
                 let artifact = artifacts.get("aarch64-apple-darwin").unwrap();
                 assert_eq!(artifact.url, "https://example.com/h.tar.gz");
@@ -3003,6 +3160,21 @@ mod tests {
             entry.worker_type,
             cli_lockfile::LockedWorkerType::Image
         ));
+    }
+
+    #[test]
+    fn lockfile_from_graph_records_engine_type_without_source() {
+        let worker = resolved_engine_worker("iii-exec", "1.2.3");
+
+        let lock = lockfile_from_graph(&graph_with(worker)).unwrap();
+
+        let entry = lock.workers.get("iii-exec").expect("entry present");
+        assert_eq!(entry.version, "1.2.3");
+        assert!(matches!(
+            entry.worker_type,
+            cli_lockfile::LockedWorkerType::Engine
+        ));
+        assert!(entry.source.is_none());
     }
 
     #[test]
@@ -3520,7 +3692,7 @@ workers:
                     lockfile.workers.contains_key(name),
                     "{name} should be pinned in iii.lock"
                 );
-                match &lockfile.workers[name].source {
+                match lockfile.workers[name].source.as_ref().unwrap() {
                     cli_lockfile::LockedSource::Binary { artifacts } => {
                         assert!(artifacts.contains_key(target));
                         assert!(artifacts.contains_key(other_target));
@@ -3604,6 +3776,118 @@ workers:
                 "legacy /download fallback should preserve the old no-lockfile behavior"
             );
             server.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn handle_managed_add_legacy_engine_response_persists_config_and_lock() {
+        in_temp_dir_async(|_| async move {
+            let _env_guard = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (base_url, server) = spawn_static_http_server(StdHashMap::from([
+                (
+                    "POST /resolve".to_string(),
+                    TestResponse {
+                        status: 405,
+                        content_type: "text/plain",
+                        body: b"method not allowed".to_vec(),
+                    },
+                ),
+                (
+                    "GET /download/iii-exec".to_string(),
+                    TestResponse {
+                        status: 204,
+                        content_type: "text/plain",
+                        body: Vec::new(),
+                    },
+                ),
+            ]))
+            .await;
+            let _api_guard = set_env_var_for_test("III_API_URL", &base_url);
+
+            let rc = handle_managed_add("iii-exec", true, false, false, false).await;
+
+            assert_eq!(rc, 0);
+            assert!(
+                std::fs::read_to_string("config.yaml")
+                    .unwrap()
+                    .contains("- name: iii-exec")
+            );
+            let lockfile = cli_lockfile::WorkerLockfile::read_from(cli_lockfile::lockfile_path())
+                .expect("lockfile written");
+            let worker = lockfile.workers.get("iii-exec").expect("engine pinned");
+            assert_eq!(worker.version, "latest");
+            assert!(matches!(
+                worker.worker_type,
+                cli_lockfile::LockedWorkerType::Engine
+            ));
+            assert!(worker.source.is_none());
+            server.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fire_engine_telemetry_percent_encodes_version_query() {
+        let _env_guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let _api_guard = set_env_var_for_test("III_API_URL", &base_url);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buf = [0_u8; 4096];
+            let n = stream.read(&mut buf).await.expect("read request");
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or_default()
+                .to_string();
+            let _ = tx.send(path);
+            let _ = stream
+                .write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        });
+
+        fire_engine_telemetry("iii-http", "1.2.3+build.5").await;
+
+        let path = rx.await.expect("request captured");
+        assert_eq!(path, "/download/iii-http?version=1.2.3%2Bbuild.5");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn handle_resolved_graph_add_persists_engine_worker_config_and_lock() {
+        in_temp_dir_async(|_| async move {
+            let graph = graph_with(resolved_engine_worker("iii-exec", "2.0.0"));
+
+            let rc = handle_resolved_graph_add(&graph, true).await;
+
+            assert_eq!(rc, 0);
+            assert!(
+                std::fs::read_to_string("config.yaml")
+                    .unwrap()
+                    .contains("- name: iii-exec")
+            );
+            let lockfile = cli_lockfile::WorkerLockfile::read_from(cli_lockfile::lockfile_path())
+                .expect("lockfile written");
+            let worker = lockfile.workers.get("iii-exec").expect("engine pinned");
+            assert_eq!(worker.version, "2.0.0");
+            assert!(matches!(
+                worker.worker_type,
+                cli_lockfile::LockedWorkerType::Engine
+            ));
+            assert!(worker.source.is_none());
         })
         .await;
     }
