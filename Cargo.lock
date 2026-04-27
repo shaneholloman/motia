@@ -2486,7 +2486,7 @@ dependencies = [
 
 [[package]]
 name = "iii"
-version = "0.11.4-next.3"
+version = "0.11.4-next.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2562,7 +2562,7 @@ dependencies = [
 
 [[package]]
 name = "iii-console"
-version = "0.11.4-next.3"
+version = "0.11.4-next.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -2635,7 +2635,7 @@ dependencies = [
 
 [[package]]
 name = "iii-sdk"
-version = "0.11.4-next.3"
+version = "0.11.4-next.4"
 dependencies = [
  "async-trait",
  "ctor",
@@ -2699,7 +2699,7 @@ dependencies = [
 
 [[package]]
 name = "iii-tools"
-version = "0.11.4-next.3"
+version = "0.11.4-next.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -3384,7 +3384,7 @@ dependencies = [
 
 [[package]]
 name = "motia-tools"
-version = "0.11.4-next.3"
+version = "0.11.4-next.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -5082,7 +5082,7 @@ dependencies = [
 
 [[package]]
 name = "scaffolder-core"
-version = "0.11.4-next.3"
+version = "0.11.4-next.4"
 dependencies = [
  "anyhow",
  "clap",
