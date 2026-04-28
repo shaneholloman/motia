@@ -4079,7 +4079,7 @@
       </aside>
 
       <div class="hero-cta">
-        <a class="hero-btn" href="#install">
+        <a class="hero-btn" href="https://iii.dev/docs/install">
           <span>get started</span>
           <span class="arrow">→</span>
         </a>
@@ -6075,7 +6075,6 @@ iii.register_function(
   function flashCopied(){
     installBtn.classList.add('copied');
     installBtnM.classList.add('copied');
-    installLabel.textContent = INSTALL_CMD;
     installLabelM.textContent = 'Copied!';
     if (heroInstallBtn){
       heroInstallBtn.classList.add('copied');
@@ -6085,7 +6084,6 @@ iii.register_function(
     copyTimer = setTimeout(() => {
       installBtn.classList.remove('copied');
       installBtnM.classList.remove('copied');
-      installLabel.textContent = 'install.sh';
       installLabelM.textContent = 'install.sh';
       if (heroInstallBtn){
         heroInstallBtn.classList.remove('copied');
@@ -6482,13 +6480,14 @@ iii.register_function(
   })();
 
   // ============= Footer install copy =============
+  // Always copies the full install command (same as the navbar). The button's
+  // visible '.cmd' text is intentionally an abbreviated display version.
   (function footInstall(){
     const btn = document.getElementById('foot-install');
     if (!btn) return;
     btn.addEventListener('click', async () => {
-      const cmd = btn.querySelector('.cmd').textContent.trim();
       try {
-        await navigator.clipboard.writeText(cmd);
+        await navigator.clipboard.writeText(INSTALL_CMD);
         btn.classList.add('copied');
         setTimeout(() => btn.classList.remove('copied'), 1400);
       } catch(_) {}
@@ -6526,6 +6525,9 @@ iii.register_function(
 
     const GUILD_ID = '1322278831184281721';
     const URL = `https://discord.com/api/guilds/${GUILD_ID}/widget.json`;
+    // Public invite endpoint exposes approximate_member_count (total members),
+    // which the widget endpoint does not. Used for the navbar/mobile total.
+    const INVITE_URL = 'https://discord.com/api/v10/invites/motia?with_counts=true';
 
     function formatCount(n){
       if (n >= 1000) return (n/1000).toFixed(n >= 10000 ? 0 : 1).replace(/\.0$/,'') + 'k';
@@ -6608,18 +6610,30 @@ iii.register_function(
 
     async function fetchData(){
       try {
-        const r = await fetch(URL, { cache:'no-store' });
-        if (!r.ok) throw new Error('http ' + r.status);
-        const data = await r.json();
-        const n = Number(data.presence_count || 0);
-        const formatted = formatCount(n);
-        countEl.textContent = formatted;
-        // Also update the navbar Discord button
+        const [widgetRes, inviteRes] = await Promise.all([
+          fetch(URL, { cache:'no-store' }),
+          fetch(INVITE_URL, { cache:'no-store' }).catch(() => null),
+        ]);
+        if (!widgetRes.ok) throw new Error('http ' + widgetRes.status);
+        const data = await widgetRes.json();
+        const presence = Number(data.presence_count || 0);
+        // Footer keeps the "online" presence count (label says "online").
+        countEl.textContent = formatCount(presence);
+        if (liveEl) liveEl.setAttribute('title', presence + ' online now');
+
+        // Navbar + mobile menu show total members (more representative).
+        // Fall back to presence count if the invite endpoint failed.
+        let total = presence;
+        if (inviteRes && inviteRes.ok){
+          const inviteData = await inviteRes.json();
+          total = Number(inviteData.approximate_member_count || presence);
+        }
+        const totalFormatted = formatCount(total);
         const navCount = document.getElementById('dc-count');
-        if (navCount) navCount.textContent = formatted;
+        if (navCount) navCount.textContent = totalFormatted;
         const mCount = document.getElementById('dc-count-m');
-        if (mCount) mCount.textContent = formatted;
-        if (liveEl) liveEl.setAttribute('title', n + ' online now');
+        if (mCount) mCount.textContent = totalFormatted;
+
         renderAvatars(data.members || []);
         root.classList.remove('is-loading');
         root.classList.remove('is-error');
