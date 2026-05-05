@@ -168,26 +168,7 @@ pub fn validate_locked_artifact_url(url: &str) -> Result<(), String> {
         ));
     }
 
-    if !is_trusted_registry_host(host) {
-        return Err(format!(
-            "artifact URL `{url}` is not trusted: expected a iii registry artifact host"
-        ));
-    }
-
     Ok(())
-}
-
-fn is_trusted_registry_host(host: &str) -> bool {
-    if matches!(host, "workers.iii.dev" | "api.workers.iii.dev") {
-        return true;
-    }
-    // Suffix match must be anchored on a non-empty label so hosts like
-    // `.workers.iii.dev` or `..workers.iii.dev` (empty leading labels) are
-    // not silently treated as trusted subdomains.
-    let Some(prefix) = host.strip_suffix(".workers.iii.dev") else {
-        return false;
-    };
-    !prefix.is_empty() && prefix.split('.').all(|label| !label.is_empty())
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -481,33 +462,37 @@ mod tests {
     }
 
     #[test]
-    fn validate_locked_artifact_url_accepts_registry_host() {
+    fn validate_locked_artifact_url_accepts_https_public_host() {
         validate_locked_artifact_url("https://workers.iii.dev/worker.tar.gz").unwrap();
+        validate_locked_artifact_url(
+            "https://github.com/iii-hq/workers/releases/download/skills/v0.1.4/skills-x86_64-unknown-linux-gnu.tar.gz",
+        )
+        .unwrap();
     }
 
     #[test]
-    fn validate_locked_artifact_url_rejects_untrusted_host() {
-        let err = validate_locked_artifact_url("https://example.com/worker.tar.gz").unwrap_err();
-        assert!(err.contains("not trusted"));
+    fn validate_locked_artifact_url_rejects_non_https() {
+        let err = validate_locked_artifact_url("http://workers.iii.dev/worker.tar.gz").unwrap_err();
+        assert!(err.contains("HTTPS"), "got: {err}");
     }
 
     #[test]
-    fn validate_locked_artifact_url_rejects_leading_dot_subdomain() {
-        // `.workers.iii.dev` literally ends with `.workers.iii.dev`, so a
-        // naive suffix check accepts it. Empty DNS labels are not valid
-        // hostnames and must not be treated as trusted registry hosts.
+    fn validate_locked_artifact_url_rejects_private_or_loopback_hosts() {
+        // Loopback / private IPs must never end up in iii.lock regardless of
+        // scheme; release builds reject them outright.
+        #[cfg(not(debug_assertions))]
+        {
+            let err = validate_locked_artifact_url("https://127.0.0.1/worker.tar.gz").unwrap_err();
+            assert!(err.contains("not trusted"), "got: {err}");
+        }
         for url in [
-            "https://.workers.iii.dev/worker.tar.gz",
-            "https://..workers.iii.dev/worker.tar.gz",
-            "https://.api.workers.iii.dev/worker.tar.gz",
+            "https://10.0.0.1/worker.tar.gz",
+            "https://192.168.1.1/worker.tar.gz",
         ] {
             let err = validate_locked_artifact_url(url)
                 .err()
                 .unwrap_or_else(|| panic!("expected {url} to be rejected"));
-            assert!(
-                err.contains("not trusted"),
-                "expected `not trusted` for {url}, got: {err}",
-            );
+            assert!(err.contains("not trusted"), "got: {err}");
         }
     }
 
