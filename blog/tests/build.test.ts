@@ -13,6 +13,7 @@ test('blog index emits at /blog/ and links to sample post', async () => {
   const html = await read('index.html')
   assert.match(html, /href="\/blog\/add-a-worker\/"/, 'index should link to /blog/add-a-worker/')
   assert.match(html, /Add a worker/i, 'index should render the sample post title')
+  assert.match(html, /id="theme-btn"/, 'index should include theme toggle (parity with iii.dev)')
 })
 
 test('sample post emits at /blog/add-a-worker/index.html', async () => {
@@ -24,6 +25,8 @@ test('sample post emits at /blog/add-a-worker/index.html', async () => {
 test('rss feed exists and references the canonical post URL', async () => {
   const xml = await read('rss.xml')
   assert.match(xml, /<rss/i)
+  assert.match(xml, /<link>https:\/\/iii\.dev\/blog\/<\/link>/, 'channel link should be blog home')
+  assert.match(xml, /atom:link[^>]*href="https:\/\/iii\.dev\/blog\/rss\.xml"/, 'feed should advertise atom:self URL')
   assert.match(xml, /https:\/\/iii\.dev\/blog\/add-a-worker\//, 'rss should use absolute /blog/ URLs')
 })
 
