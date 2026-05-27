@@ -177,6 +177,7 @@ workers:
 
 ### Managed Workers and Lockfiles
 
+- Browse registry workers at `https://workers.iii.dev/`.
 - Registry workers are installed with `iii worker add NAME[@VERSION]`.
 - Direct OCI workers use image references such as `ghcr.io/org/worker:tag`.
 - Local workers point at local binary or development paths when supported by the worker config.
@@ -208,10 +209,11 @@ Use the adaptations below when they apply to the task.
 
 ## Pattern Boundaries
 
-- For function registration and trigger binding, prefer `iii-functions-and-triggers`.
-- For invocation modes, retries, and durable enqueue decisions, prefer `iii-trigger-actions`.
-- For built-in trigger config and payload shapes, prefer `iii-trigger-schemas`.
-- For SDK instrumentation APIs, prefer the relevant SDK skill.
+- For function registration, trigger binding, invocation modes, built-in trigger shapes, custom
+  triggers, channels, and HTTP-invoked functions, prefer `iii-core-primitives`.
+- For SDK instrumentation APIs and language-specific package usage, prefer `iii-sdk-reference`.
+- For complete backend designs that combine queues, state, streams, and pub/sub, prefer
+  `iii-architecture-patterns`.
 - For worker-backed HTTP, queue, cron, pubsub, state, stream, observability, lifecycle, lockfile, and RBAC behavior, use the matching worker docs under `engine/src/workers/**/skills`.
 - Stay with `iii-engine-config` when the primary problem is configuring or deploying the engine itself.
 
