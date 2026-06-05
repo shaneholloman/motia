@@ -79,14 +79,21 @@ trace.
   <img src=".github/assets/iii-intro-preview.gif" alt="Watch the iii intro (click to play)" width="720"/>
 </a>
 
+Install `iii`:
+
+```bash
+curl -fsSL https://install.iii.dev/iii/main/install.sh | sh
+```
+
+Then scaffold and start a project:
+
 ```bash
 iii project init myapp    # scaffold a project
 cd myapp
 iii                       # start the engine
 ```
 
-Need to install `iii` first? Full walkthrough at the
-[Quickstart guide](https://iii.dev/docs/quickstart).
+Full walkthrough at the [Quickstart guide](https://iii.dev/docs/quickstart).
 
 ## Add Workers
 
@@ -105,14 +112,28 @@ Install new capabilities into a project with `iii worker add`:
 
 ## Agent Skills
 
-Install iii's agent-readable reference material:
+Install iii's agent-readable reference material for the engine primitives:
 
 ```bash
 npx skills add iii-hq/iii/skills
 ```
 
-Skills cover every iii primitive: HTTP endpoints, queues, cron, state, streams, custom triggers, and
+These cover every iii primitive: HTTP endpoints, queues, cron, state, streams, custom triggers, and
 more. See [skills/](skills/) for the full list.
+
+Each worker in [iii-hq/workers](https://github.com/iii-hq/workers) also ships its own skill. Install
+them alongside the worker itself:
+
+```bash
+npx skills add iii-hq/workers --list        # list available worker skills
+npx skills add iii-hq/workers --skill database # one worker
+npx skills add iii-hq/workers --all         # every worker skill
+```
+
+The engine's built-in workers (`iii-queue`, `iii-state`, `iii-pubsub`, `iii-stream`, `iii-cron`,
+`iii-http`, `iii-observability`, `iii-bridge`, `iii-exec`, `iii-worker-manager`) ship their skills in
+this repo. Install one with `npx skills add iii-hq/iii --full-depth --skill <name>`; each worker's README under
+[`engine/src/workers/`](engine/src/workers/) lists the exact `iii worker add` and skill command.
 
 ## Console
 
